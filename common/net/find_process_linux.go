@@ -4,9 +4,9 @@ package net
 
 import (
 	"bufio"
-	"encoding/hex"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strconv"
 	"strings"
@@ -15,7 +15,13 @@ import (
 )
 
 func FindProcess(network, srcIP string, srcPort uint16, destIP string, destPort uint16) (PID int, Name string, AbsolutePath string, err error) {
-	isLocal, err := IsLocal(net.ParseIP(srcIP))
+	srcAddr, err := netip.ParseAddr(srcIP)
+	if err != nil {
+		return 0, "", "", errors.New("invalid source IP address: ", srcIP).Base(err)
+	}
+	srcAddr = srcAddr.Unmap()
+
+	isLocal, err := IsLocal(net.IP(srcAddr.AsSlice()))
 	if err != nil {
 		return 0, "", "", errors.New("failed to determine if address is local: ", err)
 	}
@@ -26,36 +32,22 @@ func FindProcess(network, srcIP string, srcPort uint16, destIP string, destPort 
 		panic("Unsupported network type for process lookup.")
 	}
 
-	var procFile string
+	targets := procNetTargets(network, srcAddr)
 
-	switch network {
-	case "tcp":
-		if net.ParseIP(srcIP).To4() != nil {
-			procFile = "/proc/net/tcp"
-		} else {
-			procFile = "/proc/net/tcp6"
+	var inode string
+	for _, target := range targets {
+		targetHexAddr := formatLinuxProcNetAddress(srcAddr, Port(srcPort), target.ipv6)
+
+		inode, err = findInodeInFile(target.path, targetHexAddr)
+		if err != nil {
+			return 0, "", "", errors.New("could not search in ", target.path).Base(err)
 		}
-	case "udp":
-		if net.ParseIP(srcIP).To4() != nil {
-			procFile = "/proc/net/udp"
-		} else {
-			procFile = "/proc/net/udp6"
+		if inode != "" {
+			break
 		}
-	default:
-		panic("Unsupported network type for process lookup.")
-	}
-
-	targetHexAddr, err := formatLittleEndianString(net.ParseIP(srcIP), Port(srcPort))
-	if err != nil {
-		return 0, "", "", errors.New("failed to format address: ", err)
-	}
-
-	inode, err := findInodeInFile(procFile, targetHexAddr)
-	if err != nil {
-		return 0, "", "", errors.New("could not search in ", procFile).Base(err)
 	}
 	if inode == "" {
-		return 0, "", "", errors.New("connection for ", srcIP, ":", srcPort, " not found in ", procFile)
+		return 0, "", "", errors.New("connection for ", network, " ", srcIP, ":", srcPort, " not found")
 	}
 
 	pidStr, err := findPidByInode(inode)
@@ -82,24 +74,38 @@ func FindProcess(network, srcIP string, srcPort uint16, destIP string, destPort 
 	return pid, procName, absPath, nil
 }
 
-func formatLittleEndianString(addr net.IP, port Port) (string, error) {
-	ip := addr
-	var ipBytes []byte
-	if ip.To4() != nil {
-		ipBytes = ip.To4()
-	} else {
-		ipBytes = ip.To16()
+type procNetTarget struct {
+	path string
+	ipv6 bool
+}
+
+func procNetTargets(network string, addr netip.Addr) []procNetTarget {
+	prefix := "/proc/net/" + network
+	if addr.Is4() {
+		return []procNetTarget{
+			{path: prefix, ipv6: false},
+			{path: prefix + "6", ipv6: true},
+		}
 	}
-	if ipBytes == nil {
-		return "", errors.New("invalid IP format for ", addr, ": ", ip)
+	return []procNetTarget{{path: prefix + "6", ipv6: true}}
+}
+
+func formatLinuxProcNetAddress(addr netip.Addr, port Port, ipv6 bool) string {
+	var raw []byte
+	if ipv6 {
+		addr16 := addr.As16()
+		raw = addr16[:]
+	} else {
+		addr4 := addr.As4()
+		raw = addr4[:]
 	}
 
-	for i, j := 0, len(ipBytes)-1; i < j; i, j = i+1, j-1 {
-		ipBytes[i], ipBytes[j] = ipBytes[j], ipBytes[i]
+	var builder strings.Builder
+	for i := 0; i < len(raw); i += 4 {
+		fmt.Fprintf(&builder, "%02X%02X%02X%02X", raw[i+3], raw[i+2], raw[i+1], raw[i])
 	}
-	portHex := fmt.Sprintf("%04X", uint16(port))
-	ipHex := strings.ToUpper(hex.EncodeToString(ipBytes))
-	return fmt.Sprintf("%s:%s", ipHex, portHex), nil
+	fmt.Fprintf(&builder, ":%04X", uint16(port))
+	return builder.String()
 }
 
 func findInodeInFile(filePath, targetHexAddr string) (string, error) {
